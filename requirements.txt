@@ -1,0 +1,16 @@
+pymupdf
+pymupdf4llm
+pypdf
+langchain
+langchain-community
+langchain-text-splitters
+langchain-chroma
+langchain-ollama
+streamlit
+chromadb
+rank-bm25
+sentence-transformers
+flashrank
+pytesseract
+pdf2image
+Pillow
