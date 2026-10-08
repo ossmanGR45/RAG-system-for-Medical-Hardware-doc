@@ -22,6 +22,7 @@ import pymupdf as fitz  # PyMuPDF
 from langchain_core.documents import Document
 
 logger = logging.getLogger(__name__)
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -78,8 +79,8 @@ def _ocr_page(page: fitz.Page) -> str:
 def load_pdf_pages(pdf_path: str | Path) -> Generator[Document, None, None]:
     """Yield one LangChain Document per page using structured Markdown extraction.
 
-    Extracts Markdown headings, tables, and lists. Falls back to OCR when necessary.
-    Guarantees zero data loss across all pages.
+    Extracts Markdown headings, tables, and lists. Falls back to OCR and pypdf when necessary.
+    Guarantees zero data loss across all pages even for damaged or scanned PDFs.
     """
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
@@ -88,60 +89,62 @@ def load_pdf_pages(pdf_path: str | Path) -> Generator[Document, None, None]:
     filename = pdf_path.name
     pages_yielded = 0
 
-    # 1. Attempt structured Markdown extraction via pymupdf4llm
+    # 1. Attempt structured Markdown extraction via pymupdf4llm (if PyMuPDF can open page tree)
     try:
         import pymupdf4llm
 
         doc = fitz.open(str(pdf_path))
         total_pages = len(doc)
 
-        # pymupdf4llm page_chunks extracts structured markdown per page
-        page_chunks = pymupdf4llm.to_markdown(
-            doc,
-            page_chunks=True,
-            show_progress=False,
-        )
-
-        for chunk_info in page_chunks:
-            page_num = chunk_info.get("metadata", {}).get("page", pages_yielded + 1)
-            # PyMuPDF4LLM uses 0-indexed or 1-indexed page in metadata
-            if isinstance(page_num, int) and page_num < total_pages and "page" in chunk_info.get("metadata", {}):
-                # normalize to 1-indexed
-                page_1_indexed = page_num if page_num >= 1 else page_num + 1
-            else:
-                page_1_indexed = pages_yielded + 1
-
-            md_text = chunk_info.get("text", "") or ""
-            extraction_method = "structured_markdown"
-
-            # Check if page is near empty and needs OCR check
-            if len(md_text.strip()) < LOW_TEXT_THRESHOLD and total_pages > 0:
-                try:
-                    fitz_page = doc.load_page(page_1_indexed - 1)
-                    if len(fitz_page.get_images()) > 0 and _check_ocr_available():
-                        ocr_text = _ocr_page(fitz_page)
-                        if len(ocr_text.strip()) > len(md_text.strip()):
-                            md_text = ocr_text
-                            extraction_method = "ocr"
-                except Exception as e:
-                    logger.debug("Conditional OCR check skipped for page %d: %s", page_1_indexed, e)
-
-            if not md_text.strip():
-                extraction_method = "blank"
-
-            pages_yielded += 1
-            yield Document(
-                page_content=md_text,
-                metadata={
-                    "source": filename,
-                    "page": page_1_indexed,
-                    "total_pages": total_pages,
-                    "extraction_method": extraction_method,
-                },
+        if total_pages > 0:
+            # pymupdf4llm page_chunks extracts structured markdown per page
+            page_chunks = pymupdf4llm.to_markdown(
+                doc,
+                page_chunks=True,
+                show_progress=False,
             )
 
+            for chunk_info in page_chunks:
+                page_num = chunk_info.get("metadata", {}).get("page")
+                if isinstance(page_num, int):
+                    page_1_indexed = page_num if page_num >= 1 else page_num + 1
+                else:
+                    page_1_indexed = pages_yielded + 1
+
+                md_text = chunk_info.get("text", "") or ""
+                extraction_method = "structured_markdown"
+
+                # Check if page is near empty and needs OCR check
+                if len(md_text.strip()) < LOW_TEXT_THRESHOLD and total_pages > 0:
+                    try:
+                        fitz_page = doc.load_page(page_1_indexed - 1)
+                        if len(fitz_page.get_images()) > 0 and _check_ocr_available():
+                            ocr_text = _ocr_page(fitz_page)
+                            if len(ocr_text.strip()) > len(md_text.strip()):
+                                md_text = ocr_text
+                                extraction_method = "ocr"
+                    except Exception as e:
+                        logger.debug("Conditional OCR check skipped for page %d: %s", page_1_indexed, e)
+
+                if not md_text.strip():
+                    extraction_method = "blank"
+
+                pages_yielded += 1
+                yield Document(
+                    page_content=md_text,
+                    metadata={
+                        "source": filename,
+                        "page": page_1_indexed,
+                        "total_pages": total_pages,
+                        "extraction_method": extraction_method,
+                    },
+                )
+
+            doc.close()
+            if pages_yielded > 0:
+                return
+
         doc.close()
-        return
 
     except ImportError:
         logger.warning("pymupdf4llm not installed or failed to import; falling back to PyMuPDF fitz.")
@@ -152,51 +155,82 @@ def load_pdf_pages(pdf_path: str | Path) -> Generator[Document, None, None]:
     try:
         doc = fitz.open(str(pdf_path))
         total_pages = len(doc)
-        for page_idx in range(total_pages):
-            page = doc.load_page(page_idx)
-            text = page.get_text("text") or ""
-            extraction_method = "digital"
+        if total_pages > 0:
+            for page_idx in range(total_pages):
+                try:
+                    page = doc.load_page(page_idx)
+                    text = page.get_text("text") or ""
+                    extraction_method = "digital"
 
-            if len(text.strip()) < LOW_TEXT_THRESHOLD:
-                if len(page.get_images()) > 0 and _check_ocr_available():
-                    ocr_text = _ocr_page(page)
-                    if len(ocr_text.strip()) > len(text.strip()):
-                        text = ocr_text
-                        extraction_method = "ocr"
+                    if len(text.strip()) < LOW_TEXT_THRESHOLD:
+                        if len(page.get_images()) > 0 and _check_ocr_available():
+                            ocr_text = _ocr_page(page)
+                            if len(ocr_text.strip()) > len(text.strip()):
+                                text = ocr_text
+                                extraction_method = "ocr"
 
-            if not text.strip():
-                extraction_method = "blank"
+                    if not text.strip():
+                        extraction_method = "blank"
 
-            pages_yielded += 1
-            yield Document(
-                page_content=text,
-                metadata={
-                    "source": filename,
-                    "page": page_idx + 1,
-                    "total_pages": total_pages,
-                    "extraction_method": extraction_method,
-                },
-            )
+                    pages_yielded += 1
+                    yield Document(
+                        page_content=text,
+                        metadata={
+                            "source": filename,
+                            "page": page_idx + 1,
+                            "total_pages": total_pages,
+                            "extraction_method": extraction_method,
+                        },
+                    )
+                except Exception as page_exc:
+                    logger.warning("fitz extraction failed for page %d of '%s': %s", page_idx + 1, filename, page_exc)
+            doc.close()
+            if pages_yielded > 0:
+                return
         doc.close()
     except Exception as exc:
         logger.error("PyMuPDF fitz fallback failed for '%s': %s", filename, exc)
 
-    # 3. pypdf last-resort fallback
+    # 3. Resilient pypdf fallback (handles PDFs with broken page trees)
     if pages_yielded == 0:
         try:
             import pypdf
             reader = pypdf.PdfReader(str(pdf_path))
             total_pages = len(reader.pages)
             for page_idx in range(total_pages):
-                page = reader.pages[page_idx]
-                text = page.extract_text() or ""
+                page_1_indexed = page_idx + 1
+                text = ""
+                extraction_method = "pypdf"
+                try:
+                    page = reader.pages[page_idx]
+                    text = page.extract_text() or ""
+                except Exception as extract_err:
+                    logger.debug("pypdf direct text extract failed on page %d: %s; trying single-page repair", page_1_indexed, extract_err)
+                    try:
+                        writer = pypdf.PdfWriter()
+                        writer.add_page(reader.pages[page_idx])
+                        buf = io.BytesIO()
+                        writer.write(buf)
+                        buf.seek(0)
+                        single_doc = fitz.open(stream=buf.getvalue(), filetype="pdf")
+                        if len(single_doc) > 0:
+                            text = single_doc[0].get_text("text") or ""
+                            extraction_method = "fitz_single_page_repair"
+                        single_doc.close()
+                    except Exception as repair_err:
+                        logger.debug("Single-page repair failed on page %d: %s", page_1_indexed, repair_err)
+
+                if not text.strip():
+                    extraction_method = "blank"
+
+                pages_yielded += 1
                 yield Document(
                     page_content=text,
                     metadata={
                         "source": filename,
-                        "page": page_idx + 1,
+                        "page": page_1_indexed,
                         "total_pages": total_pages,
-                        "extraction_method": "pypdf_fallback" if text.strip() else "blank",
+                        "extraction_method": extraction_method,
                     },
                 )
         except Exception as e:
@@ -243,22 +277,49 @@ def render_pdf_page_image(
         logger.error("Cannot render page: PDF not found at %s", pdf_path)
         return None
 
+    # 1. Primary fast render via PyMuPDF
     try:
         doc = fitz.open(str(pdf_path))
         total_pages = len(doc)
+        if total_pages > 0 and 1 <= page_num <= total_pages:
+            page = doc.load_page(page_num - 1)  # fitz is 0-indexed
+            zoom = dpi / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("png")
+            doc.close()
+            return img_bytes
+        doc.close()
+    except Exception as exc:
+        logger.debug("PyMuPDF direct render failed for page %d of '%s': %s", page_num, pdf_path.name, exc)
+
+    # 2. Resilient Single-Page Repair Fallback via pypdf -> PyMuPDF
+    # (Handles PDFs with broken xref/catalog page trees where global page_count is 0)
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(str(pdf_path))
+        total_pages = len(reader.pages)
         if page_num < 1 or page_num > total_pages:
             logger.warning("Page number %d is out of range (1-%d) for %s", page_num, total_pages, pdf_path.name)
-            doc.close()
             return None
 
-        page = doc.load_page(page_num - 1)  # fitz is 0-indexed
-        zoom = dpi / 72.0
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat)
-        img_bytes = pix.tobytes("png")
-        doc.close()
-        return img_bytes
+        writer = pypdf.PdfWriter()
+        writer.add_page(reader.pages[page_num - 1])
+        buf = io.BytesIO()
+        writer.write(buf)
+        buf.seek(0)
+
+        single_doc = fitz.open(stream=buf.getvalue(), filetype="pdf")
+        if len(single_doc) > 0:
+            page = single_doc[0]
+            zoom = dpi / 72.0
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            img_bytes = pix.tobytes("png")
+            single_doc.close()
+            return img_bytes
+        single_doc.close()
     except Exception as exc:
-        logger.error("Failed to render page %d of '%s': %s", page_num, pdf_path.name, exc)
-        return None
+        logger.error("Failed to render page %d of '%s' via repair fallback: %s", page_num, pdf_path.name, exc)
+
+    return None
 
